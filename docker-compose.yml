@@ -1,0 +1,10 @@
+services:
+  oceanstor-simulator:
+    build: .
+    container_name: oceanstor-simulator
+    ports:
+      - "8088:8088"
+    environment:
+      - OCEANSTOR_POOL=OpenStack_Pool
+      - OCEANSTOR_TARGET_IP=192.168.1.100
+    restart: unless-stopped
