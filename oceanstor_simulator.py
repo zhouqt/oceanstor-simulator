@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -69,6 +70,9 @@ class StorageState:
         self.lungroup_luns = {}
         self.view_associations = {}
 
+        self.tgt_lun_map = {}
+        self.iscsi_mgr = None
+
         default_pg_id = self._alloc_id()
         self.portgroups[default_pg_id] = {
             "ID": default_pg_id,
@@ -81,6 +85,83 @@ class StorageState:
             rid = str(self._next_id)
             self._next_id += 1
             return rid
+
+
+class ISCSITargetManager:
+    """Manages a real iSCSI target via tgtadm for exposing LUN backing files."""
+
+    TID = 1
+
+    def __init__(self, target_ip, volume_dir="/app/volumes"):
+        self.target_ip = target_ip
+        self.target_iqn = f"iqn.2006-08.com.huawei:oceanstor:simulator:0001:{target_ip}"
+        self.volume_dir = volume_dir
+        self._lock = threading.Lock()
+        self._next_tgt_lun = 1
+        self._lun_tgt_map = {}
+
+    def start(self):
+        os.makedirs(self.volume_dir, exist_ok=True)
+        self._run(["tgtadm", "--lld", "iscsi", "--op", "new",
+                   "--mode", "target", "--tid", str(self.TID),
+                   "-T", self.target_iqn])
+        self._run(["tgtadm", "--lld", "iscsi", "--op", "bind",
+                   "--mode", "target", "--tid", str(self.TID), "-I", "ALL"])
+
+    def create_backing_file(self, lun_id, size_sectors):
+        path = os.path.join(self.volume_dir, f"lun-{lun_id}.img")
+        size_bytes = int(size_sectors) * 512
+        with open(path, "wb") as f:
+            f.truncate(size_bytes)
+        LOG.info("Created backing file %s (%d bytes)", path, size_bytes)
+        return path
+
+    def delete_backing_file(self, lun_id):
+        path = os.path.join(self.volume_dir, f"lun-{lun_id}.img")
+        if os.path.exists(path):
+            os.unlink(path)
+            LOG.info("Deleted backing file %s", path)
+
+    def expand_backing_file(self, lun_id, new_size_sectors):
+        path = os.path.join(self.volume_dir, f"lun-{lun_id}.img")
+        size_bytes = int(new_size_sectors) * 512
+        with open(path, "ab") as f:
+            f.truncate(size_bytes)
+        LOG.info("Expanded backing file %s to %d bytes", path, size_bytes)
+
+    def expose_lun(self, lun_id):
+        with self._lock:
+            if lun_id in self._lun_tgt_map:
+                return self._lun_tgt_map[lun_id]
+            lun_num = self._next_tgt_lun
+            self._next_tgt_lun += 1
+        path = os.path.join(self.volume_dir, f"lun-{lun_id}.img")
+        self._run(["tgtadm", "--lld", "iscsi", "--op", "new",
+                   "--mode", "logicalunit", "--tid", str(self.TID),
+                   "--lun", str(lun_num), "-b", path])
+        with self._lock:
+            self._lun_tgt_map[lun_id] = lun_num
+        LOG.info("Exposed LUN %s as tgt lun %d", lun_id, lun_num)
+        return lun_num
+
+    def unexpose_lun(self, lun_id):
+        with self._lock:
+            lun_num = self._lun_tgt_map.pop(lun_id, None)
+        if lun_num is not None:
+            self._run(["tgtadm", "--lld", "iscsi", "--op", "delete",
+                       "--mode", "logicalunit", "--tid", str(self.TID),
+                       "--lun", str(lun_num)])
+            LOG.info("Unexposed LUN %s (tgt lun %d)", lun_id, lun_num)
+
+    def get_tgt_lun_num(self, lun_id):
+        return self._lun_tgt_map.get(lun_id)
+
+    def _run(self, cmd):
+        LOG.debug("tgtadm: %s", " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            LOG.error("tgtadm failed (rc=%d): %s", result.returncode, result.stderr.strip())
+        return result
 
 
 STATE: StorageState = None
@@ -168,6 +249,8 @@ def handle_lun(method, path, body, qs):
             "ISADD2LUNGROUP": "false",
         }
         STATE.luns[lun_id] = lun
+        if STATE.iscsi_mgr:
+            STATE.iscsi_mgr.create_backing_file(lun_id, capacity)
         LOG.info("Created LUN %s (name=%s)", lun_id, name)
         return success(lun)
 
@@ -183,14 +266,34 @@ def handle_lun(method, path, body, qs):
         return success({"COUNT": str(len(lun_ids))})
 
     if "/lun/associate" in path:
+        assoc_obj_type = qs.get("ASSOCIATEOBJTYPE", [""])[0]
         assoc_id = qs.get("ASSOCIATEOBJID", [""])[0]
+        if assoc_obj_type == "21":
+            result_luns = []
+            for view_id, va in STATE.view_associations.items():
+                hg_id = va.get("hostgroup_id")
+                lg_id = va.get("lungroup_id")
+                if not hg_id or not lg_id:
+                    continue
+                if assoc_id not in STATE.hostgroup_hosts.get(hg_id, set()):
+                    continue
+                for lid in STATE.lungroup_luns.get(lg_id, set()):
+                    if lid in STATE.luns:
+                        lun_copy = dict(STATE.luns[lid])
+                        host_lun_id = STATE.tgt_lun_map.get(lid, 1)
+                        lun_copy["ASSOCIATEMETADATA"] = json.dumps({"HostLUNID": host_lun_id})
+                        result_luns.append(lun_copy)
+            return success(result_luns)
         lun_ids = STATE.lungroup_luns.get(assoc_id, set())
         return success([STATE.luns[lid] for lid in lun_ids if lid in STATE.luns])
 
     if "/lun/expand" in path and method == "PUT":
         lun_id = body.get("ID", "")
         if lun_id in STATE.luns:
-            STATE.luns[lun_id]["CAPACITY"] = str(body.get("CAPACITY", STATE.luns[lun_id]["CAPACITY"]))
+            new_capacity = body.get("CAPACITY", STATE.luns[lun_id]["CAPACITY"])
+            STATE.luns[lun_id]["CAPACITY"] = str(new_capacity)
+            if STATE.iscsi_mgr:
+                STATE.iscsi_mgr.expand_backing_file(lun_id, new_capacity)
             return success(STATE.luns[lun_id])
         return error(-1, "LUN not found")
 
@@ -199,6 +302,10 @@ def handle_lun(method, path, body, qs):
         if method == "GET":
             return success(STATE.luns[lun_id])
         if method == "DELETE":
+            if STATE.iscsi_mgr:
+                STATE.iscsi_mgr.unexpose_lun(lun_id)
+                STATE.iscsi_mgr.delete_backing_file(lun_id)
+            STATE.tgt_lun_map.pop(lun_id, None)
             del STATE.luns[lun_id]
             LOG.info("Deleted LUN %s", lun_id)
             return success()
@@ -390,6 +497,9 @@ def handle_lungroup(method, path, body, qs):
             STATE.lungroup_luns.setdefault(lg_id, set()).add(lun_id)
             if lun_id in STATE.luns:
                 STATE.luns[lun_id]["ISADD2LUNGROUP"] = "true"
+            if STATE.iscsi_mgr:
+                tgt_lun_num = STATE.iscsi_mgr.expose_lun(lun_id)
+                STATE.tgt_lun_map[lun_id] = tgt_lun_num
             LOG.info("Associated LUN %s to lungroup %s", lun_id, lg_id)
             return success()
         if method == "DELETE":
@@ -399,6 +509,9 @@ def handle_lungroup(method, path, body, qs):
             luns.discard(lun_id)
             if lun_id in STATE.luns:
                 STATE.luns[lun_id]["ISADD2LUNGROUP"] = "false"
+            if STATE.iscsi_mgr:
+                STATE.iscsi_mgr.unexpose_lun(lun_id)
+                STATE.tgt_lun_map.pop(lun_id, None)
             return success()
 
     path_upper = path.upper()
@@ -586,8 +699,9 @@ def handle_iscsidevicename(method, path, body, qs):
 
 
 def handle_iscsi_tgt_port(method, path, body, qs):
+    target_iqn = f"iqn.2006-08.com.huawei:oceanstor:simulator:0001:{STATE.target_ip}"
     return success([{
-        "ID": f"{STATE.target_ip},3260,0",
+        "ID": f"0+{target_iqn},t,0x0001",
         "ETHPORTID": "CTE0.A.H0",
         "TYPE": "249",
         "TPGT": "1",
@@ -951,8 +1065,10 @@ def main():
     parser.add_argument("--port", type=int, default=8088, help="Port (default: 8088)")
     parser.add_argument("--pool", default=None, help="Pool name(s), semicolon-separated")
     parser.add_argument("--target-ip", default=None, help="iSCSI target IP to advertise")
+    parser.add_argument("--volume-dir", default=None, help="Directory for LUN backing files")
     parser.add_argument("--cert-dir", default="/app/certs", help="Directory for SSL certs")
     parser.add_argument("--no-ssl", action="store_true", help="Run without HTTPS")
+    parser.add_argument("--no-iscsi", action="store_true", help="Disable real iSCSI target")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -963,9 +1079,19 @@ def main():
 
     pool_names = (args.pool or os.environ.get("OCEANSTOR_POOL", "OpenStack_Pool")).split(";")
     target_ip = args.target_ip or os.environ.get("OCEANSTOR_TARGET_IP", args.host if args.host != "0.0.0.0" else "127.0.0.1")
+    volume_dir = args.volume_dir or os.environ.get("OCEANSTOR_VOLUME_DIR", "/app/volumes")
 
     global STATE
     STATE = StorageState(pool_names, target_ip)
+
+    enable_iscsi = not args.no_iscsi and os.environ.get("OCEANSTOR_ENABLE_ISCSI", "true").lower() == "true"
+    if enable_iscsi:
+        if shutil.which("tgtadm"):
+            STATE.iscsi_mgr = ISCSITargetManager(target_ip, volume_dir)
+            STATE.iscsi_mgr.start()
+            LOG.info("iSCSI target started: %s", STATE.iscsi_mgr.target_iqn)
+        else:
+            LOG.warning("tgtadm not found; running in API-only mode (no real iSCSI)")
 
     server = HTTPServer((args.host, args.port), OceanStorHandler)
 
@@ -981,6 +1107,7 @@ def main():
     LOG.info("OceanStor Simulator started on %s://%s:%d", proto, args.host, args.port)
     LOG.info("Storage pools: %s", ", ".join(pool_names))
     LOG.info("iSCSI target IP: %s", target_ip)
+    LOG.info("iSCSI target mode: %s", "enabled" if STATE.iscsi_mgr else "disabled (API-only)")
     LOG.info("Device ID: %s", DEVICE_ID)
 
     try:
