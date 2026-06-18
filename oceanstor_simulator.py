@@ -330,6 +330,9 @@ def handle_lun(method, path, body, qs):
 def handle_snapshot(method, path, body, qs):
     parts = path.split("/")
 
+    if "/snapshot/count" in path and method == "GET":
+        return success({"COUNT": "0"})
+
     if "/snapshot/activate" in path and method == "POST":
         return success()
 
