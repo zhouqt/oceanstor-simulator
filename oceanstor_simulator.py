@@ -649,6 +649,7 @@ def handle_iscsi_initiator(method, path, body, qs):
             "USECHAP": body.get("USECHAP", "false"),
             "PARENTTYPE": "",
             "PARENTID": "",
+            "PARENTNAME": "",
             "RUNNINGSTATUS": "27",
             "HEALTHSTATUS": "1",
         }
@@ -663,6 +664,7 @@ def handle_iscsi_initiator(method, path, body, qs):
             if "PARENTID" in body:
                 ini["PARENTID"] = body["PARENTID"]
                 ini["PARENTTYPE"] = body.get("PARENTTYPE", "21")
+                ini["PARENTNAME"] = STATE.hosts.get(body["PARENTID"], {}).get("NAME", "")
                 ini["ISFREE"] = "false"
             if "USECHAP" in body:
                 ini["USECHAP"] = body["USECHAP"]
@@ -670,13 +672,15 @@ def handle_iscsi_initiator(method, path, body, qs):
                 ini["MULTIPATHTYPE"] = body["MULTIPATHTYPE"]
             return success(ini)
         if iqn:
+            parent_id = body.get("PARENTID", "")
             initiator = {
                 "ID": iqn,
                 "TYPE": "222",
                 "ISFREE": "false",
                 "USECHAP": body.get("USECHAP", "false"),
                 "PARENTTYPE": body.get("PARENTTYPE", "21"),
-                "PARENTID": body.get("PARENTID", ""),
+                "PARENTID": parent_id,
+                "PARENTNAME": STATE.hosts.get(parent_id, {}).get("NAME", ""),
                 "RUNNINGSTATUS": "27",
                 "HEALTHSTATUS": "1",
             }
