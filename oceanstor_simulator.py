@@ -34,12 +34,20 @@ CAPACITY_10TB_SECTORS = str(10 * 1024 * 1024 * 1024 * 2)  # 10TB in 512-byte sec
 
 
 class StorageState:
-    """In-memory storage state."""
+    """In-memory storage state with optional persistence."""
 
-    def __init__(self, pool_names, target_ip):
+    PERSIST_FIELDS = [
+        "luns", "snapshots", "hosts", "hostgroups", "lungroups",
+        "mappingviews", "portgroups", "iscsi_initiators", "lun_copies",
+        "qos_policies", "view_associations", "tgt_lun_map",
+    ]
+    PERSIST_SET_FIELDS = ["hostgroup_hosts", "lungroup_luns"]
+
+    def __init__(self, pool_names, target_ip, state_file=None):
         self._lock = threading.Lock()
         self._next_id = 100
         self.target_ip = target_ip
+        self._state_file = state_file
 
         self.pools = {}
         for i, name in enumerate(pool_names):
@@ -73,18 +81,56 @@ class StorageState:
         self.tgt_lun_map = {}
         self.iscsi_mgr = None
 
-        default_pg_id = self._alloc_id()
-        self.portgroups[default_pg_id] = {
-            "ID": default_pg_id,
-            "NAME": "default_iscsi_portgroup",
-            "TYPE": "257",
-        }
+        if not self._load():
+            default_pg_id = self._alloc_id()
+            self.portgroups[default_pg_id] = {
+                "ID": default_pg_id,
+                "NAME": "default_iscsi_portgroup",
+                "TYPE": "257",
+            }
 
     def _alloc_id(self):
         with self._lock:
             rid = str(self._next_id)
             self._next_id += 1
             return rid
+
+    def save(self):
+        if not self._state_file:
+            return
+        data = {"_next_id": self._next_id}
+        for field in self.PERSIST_FIELDS:
+            data[field] = getattr(self, field)
+        for field in self.PERSIST_SET_FIELDS:
+            data[field] = {k: list(v) for k, v in getattr(self, field).items()}
+        try:
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self._state_file)
+        except Exception:
+            LOG.exception("Failed to save state")
+
+    def _load(self):
+        if not self._state_file or not os.path.exists(self._state_file):
+            return False
+        try:
+            with open(self._state_file) as f:
+                data = json.load(f)
+            self._next_id = data.get("_next_id", 100)
+            for field in self.PERSIST_FIELDS:
+                if field in data:
+                    setattr(self, field, data[field])
+            for field in self.PERSIST_SET_FIELDS:
+                if field in data:
+                    setattr(self, field, {k: set(v) for k, v in data[field].items()})
+            LOG.info("Loaded state from %s (%d LUNs, %d hosts, %d initiators)",
+                     self._state_file, len(self.luns), len(self.hosts),
+                     len(self.iscsi_initiators))
+            return True
+        except Exception:
+            LOG.exception("Failed to load state from %s", self._state_file)
+            return False
 
 
 class ISCSITargetManager:
@@ -1030,6 +1076,8 @@ class OceanStorHandler(BaseHTTPRequestHandler):
             LOG.debug("Body: %s", json.dumps(body, indent=2))
 
         resp = route(method, path, body, qs)
+        if method in ("POST", "PUT", "DELETE") and resp.get("error", {}).get("code") == 0:
+            STATE.save()
         self._send_response(resp)
 
     def do_GET(self):
@@ -1096,15 +1144,24 @@ def main():
     pool_names = (args.pool or os.environ.get("OCEANSTOR_POOL", "OpenStack_Pool")).split(";")
     target_ip = args.target_ip or os.environ.get("OCEANSTOR_TARGET_IP", args.host if args.host != "0.0.0.0" else "127.0.0.1")
     volume_dir = args.volume_dir or os.environ.get("OCEANSTOR_VOLUME_DIR", "/app/volumes")
+    state_file = os.path.join(volume_dir, "state.json")
 
     global STATE
-    STATE = StorageState(pool_names, target_ip)
+    STATE = StorageState(pool_names, target_ip, state_file=state_file)
 
     enable_iscsi = not args.no_iscsi and os.environ.get("OCEANSTOR_ENABLE_ISCSI", "true").lower() == "true"
     if enable_iscsi:
         if shutil.which("tgtadm"):
             STATE.iscsi_mgr = ISCSITargetManager(target_ip, volume_dir)
             STATE.iscsi_mgr.start()
+            for lun_id, tgt_num in list(STATE.tgt_lun_map.items()):
+                path = os.path.join(volume_dir, f"lun-{lun_id}.img")
+                if os.path.exists(path):
+                    STATE.iscsi_mgr.expose_lun(lun_id)
+                    LOG.info("Re-exposed LUN %s from persisted state", lun_id)
+                else:
+                    STATE.tgt_lun_map.pop(lun_id, None)
+                    LOG.warning("LUN %s backing file missing, skipping", lun_id)
             LOG.info("iSCSI target started: %s", STATE.iscsi_mgr.target_iqn)
         else:
             LOG.warning("tgtadm not found; running in API-only mode (no real iSCSI)")
