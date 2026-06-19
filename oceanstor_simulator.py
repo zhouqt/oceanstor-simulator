@@ -692,7 +692,15 @@ def handle_mappingview(method, path, body, qs):
 def handle_iscsi_initiator(method, path, body, qs):
     parts = path.split("/")
 
-    if "/iscsi_initiator/remove_iscsi_from_host" in path:
+    if "/iscsi_initiator/remove_iscsi_from_host" in path and method == "PUT":
+        iqn = body.get("ID", "")
+        if iqn in STATE.iscsi_initiators:
+            ini = STATE.iscsi_initiators[iqn]
+            ini["PARENTID"] = ""
+            ini["PARENTTYPE"] = ""
+            ini["PARENTNAME"] = ""
+            ini["ISFREE"] = "true"
+            LOG.info("Removed initiator %s from host", iqn)
         return success()
 
     if method == "POST" and path.rstrip("/").endswith("/iscsi_initiator"):
