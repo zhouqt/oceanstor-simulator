@@ -428,6 +428,12 @@ def handle_host(method, path, body, qs):
         if method == "GET":
             return success(STATE.hosts[host_id])
         if method == "DELETE":
+            for ini in STATE.iscsi_initiators.values():
+                if ini.get("PARENTID") == host_id:
+                    ini["PARENTID"] = ""
+                    ini["PARENTTYPE"] = ""
+                    ini["PARENTNAME"] = ""
+                    ini["ISFREE"] = "true"
             del STATE.hosts[host_id]
             LOG.info("Deleted host %s", host_id)
             return success()
