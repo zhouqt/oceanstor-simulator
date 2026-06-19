@@ -637,7 +637,7 @@ def handle_mappingview(method, path, body, qs):
 def handle_iscsi_initiator(method, path, body, qs):
     parts = path.split("/")
 
-    if "/iscsi_initiator/remove_iscsi_from_host" in path and method == "POST":
+    if "/iscsi_initiator/remove_iscsi_from_host" in path:
         return success()
 
     if method == "POST" and path.rstrip("/").endswith("/iscsi_initiator"):
