@@ -110,6 +110,9 @@ class ISCSITargetManager:
 
     def create_backing_file(self, lun_id, size_sectors):
         path = os.path.join(self.volume_dir, f"lun-{lun_id}.img")
+        if os.path.exists(path):
+            LOG.info("Backing file %s already exists, skipping creation", path)
+            return path
         size_bytes = int(size_sectors) * 512
         with open(path, "wb") as f:
             f.truncate(size_bytes)
@@ -226,7 +229,7 @@ def handle_lun(method, path, body, qs):
     parts = path.split("/")
 
     if method == "POST":
-        lun_id = STATE._alloc_id()
+        lun_id = body.get("ID") or STATE._alloc_id()
         name = body.get("NAME", f"lun-{lun_id}")
         parent_id = body.get("PARENTID", "0")
         pool_name = STATE.pools.get(parent_id, {}).get("NAME", "unknown")
@@ -235,7 +238,7 @@ def handle_lun(method, path, body, qs):
         lun = {
             "ID": lun_id,
             "NAME": name,
-            "WWN": _make_wwn(lun_id),
+            "WWN": body.get("WWN", _make_wwn(lun_id)),
             "CAPACITY": str(capacity),
             "ALLOCTYPE": str(alloc_type),
             "HEALTHSTATUS": "1",
